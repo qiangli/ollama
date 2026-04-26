@@ -12,6 +12,7 @@ package embed
 
 import (
 	"fmt"
+	"net/http"
 	"net/url"
 
 	"github.com/ollama/ollama/api"
@@ -42,6 +43,8 @@ type (
 	ShowResponse = api.ShowResponse
 	// DeleteRequest deletes a local model.
 	DeleteRequest = api.DeleteRequest
+	// CreateRequest creates a model from a file or other model.
+	CreateRequest = api.CreateRequest
 	// EmbedRequest creates embeddings.
 	EmbedRequest = api.EmbedRequest
 	// EmbedResponse contains embeddings.
@@ -75,5 +78,5 @@ func NewClient(baseURL string) (*api.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse ollama base URL: %w", err)
 	}
-	return api.NewClient(u, nil), nil
+	return api.NewClient(u, http.DefaultClient), nil
 }
