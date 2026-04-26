@@ -30,7 +30,6 @@ import (
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/fs/ggml"
-	"github.com/ollama/ollama/llama"
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/model"
@@ -97,8 +96,8 @@ type llmServer struct {
 	mem         *ml.BackendMemory // Memory allocations for this model
 
 	// llamaModel is an instance of the cgo llama.cpp model definition
-	// nil if this server is running the new engine
-	llamaModel     *llama.Model
+	// nil if this server is running the new engine or built without CGo
+	llamaModel     *llamaModelHandle
 	llamaModelLock *sync.Mutex
 
 	totalLayers  uint64
@@ -142,7 +141,7 @@ func LoadModel(model string, maxArraySize int) (*ggml.GGML, error) {
 
 // NewLlamaServer will run a server for the given GPUs
 func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath string, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int) (LlamaServer, error) {
-	var llamaModel *llama.Model
+	var llamaModel *llamaModelHandle
 	var tok tokenizer.Tokenizer
 	var err error
 	if envconfig.NewEngine() || f.KV().OllamaEngineRequired() {
@@ -157,7 +156,7 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 		}
 	}
 	if tok == nil {
-		llamaModel, err = llama.LoadModelFromFile(modelPath, llama.ModelParams{VocabOnly: true})
+		llamaModel, err = loadLlamaModel(modelPath)
 		if err != nil {
 			return nil, err
 		}
@@ -302,9 +301,7 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 			msg = s.status.LastErrMsg
 		}
 		err := fmt.Errorf("error starting runner: %v %s", err, msg)
-		if llamaModel != nil {
-			llama.FreeModel(llamaModel)
-		}
+		freeLlamaModel(llamaModel)
 		return nil, err
 	}
 
@@ -1564,7 +1561,7 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 			}
 
 			// User provided a JSON schema
-			g := llama.SchemaToGrammar(req.Format)
+			g := schemaToGrammar(req.Format)
 			if g == nil {
 				return fmt.Errorf("invalid JSON schema in format")
 			}
@@ -1834,10 +1831,8 @@ func (s *ollamaServer) Detokenize(ctx context.Context, tokens []int) (string, er
 
 func (s *llmServer) Close() error {
 	s.llamaModelLock.Lock()
-	if s.llamaModel != nil {
-		llama.FreeModel(s.llamaModel)
-		s.llamaModel = nil
-	}
+	freeLlamaModel(s.llamaModel)
+	s.llamaModel = nil
 	s.llamaModelLock.Unlock()
 
 	if s.cmd != nil {
