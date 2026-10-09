@@ -62,13 +62,16 @@ func Compile(fn ClosureFunc) *CompiledFunc {
 // CompileShapeless compiles with optional shapeless mode.
 // If shapeless=true, the function works for any input shape after tracing.
 func CompileShapeless(fn ClosureFunc, shapeless bool) *CompiledFunc {
-	// Create a cgo.Handle to prevent the Go function from being GC'd
-	handle := cgo.NewHandle(fn)
+	// Keep the Go function alive through a cgo.Handle stored in C memory;
+	// the handle is an integer, so pass a pointer to it, never the handle
+	// itself as a pointer (see runtime/cgo.Handle).
+	payload := (*cgo.Handle)(C.malloc(C.size_t(unsafe.Sizeof(cgo.Handle(0)))))
+	*payload = cgo.NewHandle(fn)
 
 	// Create the closure from the Go callback
 	closure := C.mlx_closure_new_func_payload(
 		(*[0]byte)(C.goClosureCallback),
-		*(*unsafe.Pointer)(unsafe.Pointer(&handle)),
+		unsafe.Pointer(payload),
 		(*[0]byte)(C.goClosureDestructor),
 	)
 
@@ -140,7 +143,7 @@ func goClosureCallback(res *C.mlx_vector_array, input C.mlx_vector_array, payloa
 	}()
 
 	// Recover the Go function from the handle
-	handle := cgo.Handle(payload)
+	handle := *(*cgo.Handle)(payload)
 	fn := handle.Value().(ClosureFunc)
 
 	// Convert input vector to Go slice - use borrowArray since MLX owns these
@@ -166,6 +169,7 @@ func goClosureCallback(res *C.mlx_vector_array, input C.mlx_vector_array, payloa
 
 //export goClosureDestructor
 func goClosureDestructor(payload unsafe.Pointer) {
-	handle := cgo.Handle(payload)
+	handle := *(*cgo.Handle)(payload)
 	handle.Delete()
+	C.free(payload)
 }
