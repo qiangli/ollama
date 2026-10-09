@@ -68,7 +68,7 @@ func CompileShapeless(fn ClosureFunc, shapeless bool) *CompiledFunc {
 	// Create the closure from the Go callback
 	closure := C.mlx_closure_new_func_payload(
 		(*[0]byte)(C.goClosureCallback),
-		unsafe.Pointer(handle),
+		*(*unsafe.Pointer)(unsafe.Pointer(&handle)),
 		(*[0]byte)(C.goClosureDestructor),
 	)
 
