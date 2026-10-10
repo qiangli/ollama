@@ -26,6 +26,9 @@ ml/backend/ggml/ggml/src/ggml-metal/ggml-metal-embed.metal: ml/backend/ggml/ggml
 .PHONY: llama/llama.cpp
 llama/llama.cpp: llama/vendor
 	rsync -arvzc --delete -f "include LICENSE" -f "merge $@/.rsync-filter" $(addprefix $<,/LICENSE /) $@
+	# Go module zips drop files under any vendor/ directory, so keep upstream's
+	# vendor/ headers under a module-safe name.
+	rm -rf $@/third_party && mv $@/vendor $@/third_party
 
 .PHONY: ml/backend/ggml/ggml
 ml/backend/ggml/ggml: llama/vendor
