@@ -1,161 +1,79 @@
 #!/usr/bin/env bash
-# no-egress-test.sh ARCHIVE.tgz
-#
-# Extract the exact release archive, start `ollama serve` on loopback with
-# cloud features disabled, exercise /api/version and /api/tags, then idle.
-# Linux traces the whole process tree in a network namespace and fails only on
-# AF_INET/AF_INET6 attempts whose destination is not loopback. AF_UNIX,
-# AF_NETLINK and AF_UNSPEC are deliberately outside the verdict. macOS denies
-# non-loopback outbound traffic with sandbox-exec and fails on any matching
-# sandbox denial.
+# Hosted native inference only. Never execute this workload on Dragon.
 set -euo pipefail
-
 here=$(cd "$(dirname "$0")" && pwd)
-archive=${1:?usage: no-egress-test.sh ARCHIVE.tgz}
-archive=$(cd "$(dirname "$archive")" && pwd)/$(basename "$archive")
-port=${EGRESS_PORT:-18449}
-observe=${EGRESS_OBSERVE_SECONDS:-30}
-ready_max=${EGRESS_READY_SECONDS:-180}
-
-die() {
-	echo "no-egress: FAIL: $*" >&2
-	if [[ -n ${work:-} && -s $work/server.log ]]; then
-		echo "---- server.log (last 80 lines) ----" >&2
-		tail -n 80 "$work/server.log" >&2 || true
-	fi
-	exit 1
+[[ $# == 1 ]] || { echo 'usage: no-egress-test.sh out/runner-OS-ARCH' >&2; exit 2; }
+[[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] || {
+  echo 'native gate requires a GitHub-hosted runner' >&2; exit 1;
 }
-[[ -f $archive ]] || die "$archive is not a file"
-
-work=$(mktemp -d "${TMPDIR:-/tmp}/ollama-egress.XXXXXX")
-chmod 755 "$work"
-mkdir -p "$work/root" "$work/home" "$work/models"
-tar -xzf "$archive" -C "$work/root"
-bin=$work/root/bin/ollama
-[[ -x $bin ]] || die "archive has no executable bin/ollama"
-[[ -x $work/root/lib/ollama/llama-server ]] || die "archive has no lib/ollama/llama-server"
-
-envfile=$work/server.env
-{
-	echo "HOME=$work/home"
-	echo "PATH=/usr/bin:/bin"
-	echo "OLLAMA_HOST=127.0.0.1:$port"
-	echo "OLLAMA_MODELS=$work/models"
-	grep -E '^[A-Z_]+=' "$here/no-tracking.env"
-	grep -E '^[A-Z_]+=' "$here/otel.env"
-} >"$envfile"
-
-probe() {
-	local base=http://127.0.0.1:$port body
-	body=$(curl -fsS "$base/api/version")
-	[[ $body == *'"version"'* ]] || return 1
-	body=$(curl -fsS "$base/api/tags")
-	[[ $body == *'"models"'* ]] || return 1
+case $(hostname | tr '[:upper:]' '[:lower:]') in *dragon*) echo 'Dragon native gate prohibited' >&2; exit 1;; esac
+asset=$(basename "$1")
+bin=$1
+[[ $asset != runner-windows-amd64 ]] || bin=$1.exe
+[[ -f $bin && -f $1.json ]] || { echo 'missing gated executable/metadata' >&2; exit 1; }
+bin=$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")
+out=$(dirname "$bin")
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/home"
+# Invalidate stale evidence before any fixture/tool/runtime operation.
+python3 -c 'import json,sys; open(sys.argv[1], "w").write(json.dumps({"status":"FAIL", "error":"native gate incomplete"})+"\n")' "$out/$asset-native.json"
+: >"$out/$asset-egress.txt"
+python3 "$here/fetch-fixture.py" "$work/model.gguf" >>"$out/$asset-egress.txt" 2>&1 || {
+  cat "$out/$asset-egress.txt" >&2; exit 1;
 }
-
-wait_ready() { # PID
-	local i
-	for ((i = 0; i < ready_max; i++)); do
-		kill -0 "$1" 2>/dev/null || return 1
-		curl -fsS -o /dev/null "http://127.0.0.1:$port/api/version" && return 0
-		sleep 1
-	done
-	return 1
-}
-
-linux() {
-	local log=$work/strace.log inner=$work/inner.sh
-	local ruid rgid
-	ruid=$(id -u) rgid=$(id -g)
-	cat >"$inner" <<INNER
-set -euo pipefail
-ip link set lo up
-$(declare -f probe wait_ready)
-port=$port ready_max=$ready_max
-strace -f -qq -e trace=connect,sendto,sendmsg,sendmmsg -e signal=none -o '$log' \\
-	setpriv --reuid=$ruid --regid=$rgid --init-groups -- \\
-	env -i \$(cat '$envfile') '$bin' serve >'$work/server.log' 2>&1 &
-tracer=\$!
-if ! wait_ready \$tracer; then
-	echo "server did not become ready on 127.0.0.1:$port" >&2
-	tail -n 80 '$work/server.log' >&2 || true
-	pkill -KILL -P \$tracer || true
-	exit 1
-fi
-probe
-sleep $observe
-probe
-pkill -TERM -P \$tracer || true
-wait \$tracer || true
-INNER
-	sudo unshare --net -- bash "$inner" || die "server run failed (see above)"
-	[[ -s $log ]] || die "no strace log recorded"
-
-	local bad=() line fam host p
-	while IFS= read -r line; do
-		case $line in
-		*sa_family=AF_INET6*)
-			fam=inet6
-			host=$(sed -n 's/.*inet_pton(AF_INET6, "\([^"]*\)".*/\1/p' <<<"$line")
-			p=$(sed -n 's/.*sin6_port=htons(\([0-9]*\)).*/\1/p' <<<"$line")
-			;;
-		*sa_family=AF_INET,*)
-			fam=inet
-			host=$(sed -n 's/.*sin_addr=inet_addr("\([^"]*\)").*/\1/p' <<<"$line")
-			p=$(sed -n 's/.*sin_port=htons(\([0-9]*\)).*/\1/p' <<<"$line")
-			;;
-		*) continue ;; # AF_UNIX, AF_UNSPEC, AF_NETLINK, or no address
-		esac
-		case $host in
-		127.* | ::1 | ::ffff:127.*) continue ;;
-		esac
-		bad+=("$fam $host:$p :: $line")
-	done <"$log"
-
-	if ((${#bad[@]})); then
-		printf 'no-egress: outbound attempt: %s\n' "${bad[@]}" >&2
-		die "${#bad[@]} non-loopback AF_INET/AF_INET6 connection attempt(s)"
-	fi
-	echo "no-egress: linux: $(grep -c . "$log") traced socket syscalls; no non-loopback AF_INET/AF_INET6 attempts OK"
-}
-
-darwin() {
-	local profile=$work/no-egress.sb start pid
-	cat >"$profile" <<SB
+# Fixed configured endpoint, never silently retry a collision on another port.
+port=18997
+args=("$bin" "$work/model.gguf" "$out/$asset-native.json" "$port")
+case $(uname -s) in
+Linux)
+  # shellcheck source=/dev/null
+  . "$here/egress-verdict.sh"
+  for tool in sudo unshare ip strace setpriv python3; do command -v "$tool" >/dev/null; done
+  chmod 755 "$work"
+  # Entire exercise and child tree is traced; network namespace has only lo.
+  # shellcheck disable=SC2024
+  sudo -n unshare --net -- bash -c '
+    set -euo pipefail
+    ip link set lo up
+    ulimit -f 32768
+    exec strace -f -qq -s 256 -e trace=connect,sendto,sendmsg,sendmmsg -o "$1/trace" \
+      setpriv --reuid="$2" --regid="$3" --init-groups \
+      env -i PATH=/usr/bin:/bin HOME="$1/home" \
+      python3 "$4/native-gate.py" "${@:5}"
+  ' bash "$work" "$(id -u)" "$(id -g)" "$here" "${args[@]}" >>"$out/$asset-egress.txt" 2>&1 || {
+    cat "$out/$asset-egress.txt" >&2; exit 1;
+  }
+  [[ -s $work/trace ]] || { echo 'missing network trace' >&2; exit 1; }
+  cat "$work/trace" >>"$out/$asset-egress.txt"
+  egress_verdict "$work/trace" "$port" >>"$out/$asset-egress.txt"
+  ;;
+Darwin)
+  command -v sandbox-exec >/dev/null
+  cat >"$work/profile.sb" <<SB
 (version 1)
 (allow default)
-(deny network-outbound (remote ip "*:*"))
-(allow network-outbound (remote ip "localhost:*"))
-(deny network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
+(deny network-outbound)
+(allow network-outbound (remote ip "127.0.0.1:$port"))
 SB
-	start=$(date '+%Y-%m-%d %H:%M:%S')
-	# shellcheck disable=SC2046
-	env -i $(cat "$envfile") sandbox-exec -f "$profile" "$bin" serve >"$work/server.log" 2>&1 &
-	pid=$!
-	if ! wait_ready "$pid"; then
-		kill -KILL "$pid" 2>/dev/null || true
-		die "server did not become ready on 127.0.0.1:$port"
-	fi
-	probe
-	sleep "$observe"
-	probe
-	kill -TERM "$pid" 2>/dev/null || true
-	wait "$pid" || true
-	sleep 2
-
-	local denies
-	denies=$(log show --style syslog --start "$start" \
-		--predicate 'sender == "Sandbox" AND eventMessage CONTAINS "network-outbound"' 2>/dev/null |
-		grep -E 'ollama\(|llama-server\(' || true)
-	if [[ -n $denies ]]; then
-		echo "$denies" >&2
-		die "sandbox denied non-loopback outbound network attempt(s)"
-	fi
-	echo "no-egress: darwin: no non-loopback sandbox network-outbound denies for ollama OK"
-}
-
-case $(uname -s) in
-Linux) linux ;;
-Darwin) darwin ;;
-*) die "unsupported OS $(uname -s)" ;;
+  # Includes wrong-loopback-port, IPv4, IPv6 and UDP denial controls.
+  sandbox-exec -f "$work/profile.sb" python3 "$here/native-gate.py" --deny-controls "$port" >>"$out/$asset-egress.txt" 2>&1
+  env -i PATH="$PATH" HOME="$work/home" sandbox-exec -f "$work/profile.sb" \
+    python3 "$here/native-gate.py" "${args[@]}" >>"$out/$asset-egress.txt" 2>&1 || {
+    cat "$out/$asset-egress.txt" >&2; exit 1;
+  }
+  ;;
+MINGW*|MSYS*)
+  command -v gcc >/dev/null
+  # Compile only on the hosted Windows image, using the same MinGW provision.
+  gcc -std=c11 -Wall -Wextra -Werror -municode "$here/windows-net-guard.c" \
+    -o "$work/net-guard.exe" -lfwpuclnt -lws2_32 -lrpcrt4
+  python3 "$here/native-gate.py" "${args[@]}" "$work/net-guard.exe" >>"$out/$asset-egress.txt" 2>&1 || {
+    cat "$out/$asset-egress.txt" >&2; exit 1;
+  }
+  ;;
+*) echo 'unsupported native gate platform' >&2; exit 1;;
 esac
+# Only publish PASS after both protocol and platform enforcement have passed.
+python3 "$here/native-gate.py" --finalize "$out/$asset-native.json" "$out/$asset-egress.txt"
+cat "$out/$asset-native.json"
