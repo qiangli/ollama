@@ -2,7 +2,7 @@ module github.com/ollama/ollama
 
 go 1.27
 
-toolchain go1.27.1
+toolchain go1.27.2
 
 require (
 	github.com/TheTitanrain/w32 v0.0.0-20180517000239-4f5cfb03fabf
