@@ -8,11 +8,20 @@ from pathlib import Path
 import re
 
 TARGETS = ("linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64", "windows-amd64")
-PERMISSIVE = {"MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause"}
+# MIT-0 elected for miniaudio's dual Unlicense OR MIT-0 (S436/#2028): the
+# policy admits MIT, BSD, Apache-2.0, ISC and similar, and MIT-0 is the
+# no-attribution MIT variant.
+PERMISSIVE = {"MIT", "MIT-0", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause"}
 SYSTEM_LIBS = {
     "linux": {"libc.so.6", "libdl.so.2", "libgcc_s.so.1", "libm.so.6", "libpthread.so.0", "libresolv.so.2", "librt.so.1", "libstdc++.so.6"},
-    "darwin": {"/usr/lib/libSystem.B.dylib", "/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate", "/System/Library/Frameworks/Metal.framework/Versions/A/Metal", "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation", "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit", "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore", "/System/Library/Frameworks/MetalKit.framework/Versions/A/MetalKit", "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/MetalPerformanceShaders", "/System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo", "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics", "/System/Library/Frameworks/Security.framework/Versions/A/Security", "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit", "/System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox"},
-    "windows": {"advapi32.dll", "bcrypt.dll", "crypt32.dll", "kernel32.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "shell32.dll", "user32.dll", "ws2_32.dll", "winmm.dll", "winhttp.dll", "version.dll", "secur32.dll"},
+    # Darwin: /usr/lib/libc++.1.dylib and /usr/lib/libresolv.9.dylib are Apple
+    # system libraries linked by the runner on both arches (CI run 38537053528);
+    # /usr/lib/libobjc.A.dylib is the Apple ObjC runtime, observed only on arm64.
+    "darwin": {"/usr/lib/libSystem.B.dylib", "/usr/lib/libc++.1.dylib", "/usr/lib/libresolv.9.dylib", "/usr/lib/libobjc.A.dylib", "/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate", "/System/Library/Frameworks/Metal.framework/Versions/A/Metal", "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation", "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation", "/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit", "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore", "/System/Library/Frameworks/MetalKit.framework/Versions/A/MetalKit", "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/MetalPerformanceShaders", "/System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo", "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics", "/System/Library/Frameworks/Security.framework/Versions/A/Security", "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit", "/System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox"},
+    # Windows: the 13 api-ms-win-crt-*-l1-1-0.dll API sets are the Universal C
+    # Runtime forwarders linked by the MinGW clang runner (CI run 38537053528);
+    # enumerated by exact name, no wildcard.
+    "windows": {"advapi32.dll", "bcrypt.dll", "crypt32.dll", "kernel32.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "shell32.dll", "user32.dll", "ws2_32.dll", "winmm.dll", "winhttp.dll", "version.dll", "secur32.dll", "api-ms-win-crt-convert-l1-1-0.dll", "api-ms-win-crt-environment-l1-1-0.dll", "api-ms-win-crt-filesystem-l1-1-0.dll", "api-ms-win-crt-heap-l1-1-0.dll", "api-ms-win-crt-locale-l1-1-0.dll", "api-ms-win-crt-math-l1-1-0.dll", "api-ms-win-crt-multibyte-l1-1-0.dll", "api-ms-win-crt-private-l1-1-0.dll", "api-ms-win-crt-runtime-l1-1-0.dll", "api-ms-win-crt-stdio-l1-1-0.dll", "api-ms-win-crt-string-l1-1-0.dll", "api-ms-win-crt-time-l1-1-0.dll", "api-ms-win-crt-utility-l1-1-0.dll"},
 }
 
 
@@ -286,7 +295,7 @@ def review_native_licenses(out, review_path, output):
             result.append({"target": target, "path": path, "sha256": digest,
                            "license": license_id, "notice": notice})
     Path(output).write_text(json.dumps({"schema": "bashy-runner-native-license-review-v1",
-        "policy": "exact SHA-256 match; MIT/BSD/Apache-2.0 only; explicit notice required", "inputs": result},
+        "policy": "exact SHA-256 match; MIT/MIT-0/BSD/Apache-2.0 only; explicit notice required", "inputs": result},
         indent=2, sort_keys=True) + "\n")
 
 
@@ -306,7 +315,7 @@ def licenses(report, notices, output):
             entries.append({"package": name, "license": license_id})
     if not entries:
         fail("compiled Go license report is empty")
-    Path(output).write_text(json.dumps({"schema": "bashy-runner-license-review-v1", "policy": "MIT/BSD/Apache-2.0 only", "packages": entries}, indent=2, sort_keys=True) + "\n")
+    Path(output).write_text(json.dumps({"schema": "bashy-runner-license-review-v1", "policy": "MIT/MIT-0/BSD/Apache-2.0 only", "packages": entries}, indent=2, sort_keys=True) + "\n")
 
 
 def aggregate_sbom(out):
@@ -363,7 +372,32 @@ def no_findings(report, tool, predicate):
         fail(f"{tool}: unresolved vulnerability findings ({len(found)}); see {report}")
 
 
-def osv(report):
+def vuln_ignored_ids(path=None):
+    # Reviewed OSV waivers live in the vuln-ignore file shipped next to this
+    # script (builds/ollama/files/vuln-ignore): one GO-YYYY-NNNN id per line
+    # with its justification, `#` comments and blank lines allowed. A missing
+    # file waives nothing. A non-comment line whose first token is not an OSV
+    # id fails closed: a waiver file the gate cannot read exactly is refused.
+    sibling = Path(__file__).with_name("vuln-ignore")
+    target = Path(path) if path is not None else sibling
+    try:
+        text = target.read_text()
+    except OSError:
+        return set()
+    ids = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        token = line.split()[0]
+        if not re.fullmatch(r"GO-[0-9]+-[0-9]+", token):
+            fail(f"malformed vuln-ignore entry: {line}")
+        ids.add(token)
+    return ids
+
+
+def osv(report, ignore=None):
+    ignored = vuln_ignored_ids(ignore)
     def findings(data):
         found = []
         def walk(value):
@@ -375,7 +409,9 @@ def osv(report):
             elif isinstance(value, list):
                 for child in value: walk(child)
         walk(data)
-        return found
+        # Exact id match only: a waived id excuses that finding, every other
+        # finding still fails. No prefix, substring or family matching.
+        return [v for v in found if not (isinstance(v, dict) and v.get("id") in ignored)]
     no_findings(report, "OSV-Scanner", findings)
 
 
@@ -444,7 +480,7 @@ def main():
     q = sub.add_parser("compiler-inputs"); q.add_argument("--capture", required=True); q.add_argument("--source", required=True); q.add_argument("--generated", required=True); q.add_argument("--output", required=True)
     q = sub.add_parser("native-licenses"); q.add_argument("--out", required=True); q.add_argument("--review", required=True); q.add_argument("--output", required=True)
     q = sub.add_parser("licenses"); q.add_argument("--report", required=True); q.add_argument("--notices", required=True); q.add_argument("--output", required=True)
-    q = sub.add_parser("osv"); q.add_argument("--report", required=True)
+    q = sub.add_parser("osv"); q.add_argument("--report", required=True); q.add_argument("--ignore", default=None)
     q = sub.add_parser("grype"); q.add_argument("--report", required=True)
     q = sub.add_parser("aggregate-sbom"); q.add_argument("--out", type=Path, required=True)
     q = sub.add_parser("final"); q.add_argument("--out", type=Path, required=True); q.add_argument("--commit", required=True)
@@ -452,7 +488,7 @@ def main():
     {"inventory": lambda: inventory(a.out, a.report), "merge-inputs": lambda: merge_inputs(a.out),
      "compiler-inputs": lambda: compiler_inputs(a.capture, a.source, a.generated, a.output),
      "native-licenses": lambda: review_native_licenses(a.out, a.review, a.output), "licenses": lambda: licenses(a.report, a.notices, a.output),
-     "osv": lambda: osv(a.report), "grype": lambda: grype(a.report), "aggregate-sbom": lambda: aggregate_sbom(a.out), "final": lambda: final(a.out, a.commit)}[a.mode]()
+     "osv": lambda: osv(a.report, a.ignore), "grype": lambda: grype(a.report), "aggregate-sbom": lambda: aggregate_sbom(a.out), "final": lambda: final(a.out, a.commit)}[a.mode]()
 
 
 if __name__ == "__main__":

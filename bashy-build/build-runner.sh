@@ -20,6 +20,12 @@ export GOAMD64=v1 GOARM64=v8.0
 }
 [[ $(go env GOVERSION) == "go$GO_TOOLCHAIN" ]] || { echo 'wrong Go toolchain' >&2; exit 1; }
 bash "$here/source-guard.sh" "$src"
+# Reviewed module bumps (PIN GO_SECURITY_OVERRIDES): after the pin gates, before
+# go list/go build, so the inventory, deps, SBOM and binary all reflect the
+# overridden tree. S436/#2028: nine x/* modules at their MVS-selected
+# versions plus github.com/buger/jsonparser@v1.1.2 (GO-2026-4514). The one
+# OSV waiver (GO-2026-5932) lives in vuln-ignore for the audit job's OSV gate.
+bash "$here/go-security-overrides.sh" "$src"
 # No caller-selected optimization flags, overlays, alternate compilers or tags.
 unset CGO_CFLAGS CGO_CPPFLAGS CGO_CXXFLAGS CGO_LDFLAGS GOEXPERIMENT
 # The build compiles exactly ./cmd/runner — never ./... or sibling mains —
@@ -118,7 +124,11 @@ windows)
   objdump=${BASHY_WINDOWS_OBJDUMP:?verified LLVM objdump missing (windows-compilers.py)}
   : >"$out/$asset-dlls.txt"
   echo "== $out/$exe ==" >>"$out/$asset-dlls.txt"
-  "$objdump" -p "$out/$exe" | grep -i 'DLL Name:' | awk '{print $NF}' | sort -u >>"$out/$asset-dlls.txt"
+  # Case-sensitive 'DLL Name:': llvm-objdump prints imports as 'DLL Name:' but
+  # the runner's own cgo //export table as 'DLL name: a.out.exe' — grep -i
+  # would record the export table as an import (CI run 38537053528). The
+  # audit's windows_dlls parser stays strict (bare 'name.dll' lines only).
+  "$objdump" -p "$out/$exe" | grep 'DLL Name:' | awk '{print $NF}' | sort -u >>"$out/$asset-dlls.txt"
   cat "$out/$asset-dlls.txt"
   if grep -Ei 'libzmq|highs|libcurl|nng\.dll|msys-2\.0\.dll|cygwin|python[0-9]*\.dll' "$out/$asset-dlls.txt"; then
     echo 'unexpected Windows dynamic dependency' >&2; exit 1
