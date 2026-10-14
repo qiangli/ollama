@@ -36,10 +36,17 @@ def digest(path):
 
 
 def deny_controls(port):
-    """EPERM/EACCES, not timeout/refused/unreachable, proves sandbox enforcement."""
+    """EPERM/EACCES, not timeout/refused/unreachable, proves sandbox enforcement.
+
+    Never probe an allowlisted endpoint: Seatbelt expands "localhost" in the
+    (remote ip "localhost:PORT") allow rule to both 127.0.0.1 and ::1, so a
+    same-port ::1 control is policy-ALLOWED and fails closed here with
+    ECONNREFUSED instead of EPERM (darwin CI run 38503381935). The
+    wrong-port ::1 control below still proves IPv6 enforcement.
+    """
     for family, host, remote in [(socket.AF_INET, '192.0.2.1', 443),
                                   (socket.AF_INET, '127.0.0.1', port + 1),
-                                  (socket.AF_INET6, '::1', port)]:
+                                  (socket.AF_INET6, '::1', port + 1)]:
         for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
             with socket.socket(family, kind) as s:
                 s.settimeout(2)
@@ -163,6 +170,28 @@ def check_owner(pid, port):
     return output.strip()
 
 
+def shutdown_runner(proc, windows=None):
+    """End the exercised runner and prove the shutdown status.
+
+    Unix runners die on SIGTERM. The pinned upstream implements no graceful
+    Windows stop (it reads no stdin command and installs no catchable
+    terminate handler; its own server ends runners with Process.Kill), so on
+    Windows the gate performs the documented controlled forced shutdown:
+    TerminateProcess reports exit code 1, the guard reaps the process, and
+    the caller proves no listener remains. A graceful 0 on Windows is
+    rejected: it cannot be the forced shutdown this gate proves.
+    """
+    if windows is None:
+        windows = os.name == 'nt'
+    proc.terminate()
+    result = proc.wait(timeout=10)
+    if windows:
+        require(result == 1, f'unexpected Windows shutdown status {result}')
+    else:
+        require(result == -signal.SIGTERM, f'unexpected shutdown status {result}')
+    return result
+
+
 def wait_health(proc, port, expected):
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
@@ -243,14 +272,7 @@ def exercise(binary, fixture, evidence_path, port):
             require(canceled['seconds_to_reuse'] < 15, 'cancellation failed to free single slot')
             evidence['checks']['cancellation_slot_reuse'] = canceled
             require(proc.poll() is None, 'runner died during protocol checks')
-            if os.name == 'nt':
-                proc.stdin.write(b'stop\n')
-                proc.stdin.flush()
-            else:
-                proc.terminate()
-            result = proc.wait(timeout=10)
-            require(result == (0 if os.name == 'nt' else -signal.SIGTERM),
-                    f'unexpected shutdown status {result}')
+            result = shutdown_runner(proc)
             with socket.socket() as probe:
                 probe.settimeout(1)
                 require(probe.connect_ex(('127.0.0.1', port)) != 0, 'listener survived shutdown')
@@ -277,12 +299,7 @@ def exercise(binary, fixture, evidence_path, port):
                     pass
             if proc.poll() is None:
                 if os.name == 'nt':
-                    try:
-                        proc.stdin.write(b'stop\n')
-                        proc.stdin.flush()
-                        proc.wait(timeout=5)
-                    except (OSError, subprocess.TimeoutExpired):
-                        proc.kill()
+                    proc.terminate()
                 proc.wait(timeout=10)
             proc.stdin.close()
         evidence_path.write_text(json.dumps(evidence, indent=2) + '\n')
