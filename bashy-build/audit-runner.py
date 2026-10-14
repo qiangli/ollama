@@ -419,6 +419,102 @@ def grype(report):
     no_findings(report, "Grype", lambda d: d.get("matches", []))
 
 
+def govulncheck_stream(path):
+    # govulncheck -mode=binary -json writes concatenated JSON documents
+    # (pretty-printed, one object after another), not a single document or
+    # newline-delimited JSON. Anything else fails closed: the gate must read
+    # exactly what the scanner wrote.
+    try:
+        text = Path(path).read_text()
+    except OSError as exc:
+        fail(f"cannot read govulncheck JSON report {path}: {exc}")
+    decoder = json.JSONDecoder(); offset = 0; messages = []
+    while offset < len(text):
+        while offset < len(text) and text[offset].isspace(): offset += 1
+        if offset == len(text): break
+        try: item, offset = decoder.raw_decode(text, offset)
+        except json.JSONDecodeError as exc: fail(f"invalid govulncheck JSON stream {path}: {exc}")
+        if not isinstance(item, dict):
+            fail(f"malformed govulncheck JSON message in {path}")
+        messages.append(item)
+    if not messages:
+        fail(f"govulncheck JSON report is empty: {path}")
+    return messages
+
+
+def finding_level(finding):
+    # Standing verdict rule (bashy policy: scripts/govulncheck-release.sh and
+    # builds/_shared/kinds/go/audit.yml): a finding is REACHABLE only when
+    # its trace's first frame names a function (symbol-level, called). A
+    # first frame with a package but no function is package-level; anything
+    # else (a module-only frame, or a missing or empty trace) is
+    # module-level.
+    top = (finding.get("trace") or [{}])[0]
+    if not isinstance(top, dict):
+        top = {}
+    if top.get("function"):
+        return "REACHABLE"
+    if top.get("package"):
+        return "package"
+    return "module"
+
+
+def govulncheck(out, ignore=None, targets=TARGETS):
+    # Binary-reachability gate over the per-target govulncheck -json reports
+    # under the standing verdict rule: only REACHABLE findings fail, and
+    # only when their exact OSV id is not waived in vuln-ignore.
+    # Module-level and package-level findings are REPORTED (one line per id,
+    # target and level on stdout, plus the JSON summary) but do not fail.
+    # Advisory metadata ("osv" messages) never excuses or accuses: only
+    # findings decide. Exact id match only, same parser as the OSV gate.
+    out = Path(out)
+    ignored = vuln_ignored_ids(ignore)
+    wanted = [t.strip() for t in targets] if not isinstance(targets, str) else [t.strip() for t in targets.split(",")]
+    unknown = [t for t in wanted if t not in TARGETS]
+    if not wanted or unknown:
+        fail(f"govulncheck targets must be a subset of {','.join(TARGETS)}")
+    summary = {"schema": "bashy-runner-govulncheck-review-v1",
+               "policy": "reachable findings fail unless waived in vuln-ignore; module- and package-level findings are reported only",
+               "targets": {}}
+    bad = {}
+    for target in wanted:
+        report = out / f"runner-{target}.govulncheck.json"
+        reachable = set()
+        reported = set()
+        for message in govulncheck_stream(report):
+            if "finding" not in message:
+                continue
+            finding = message["finding"]
+            if not isinstance(finding, dict) or not isinstance(finding.get("osv"), str):
+                fail(f"malformed govulncheck finding in {report.name}")
+            level = finding_level(finding)
+            if level == "REACHABLE":
+                reachable.add(finding["osv"])
+            else:
+                reported.add((finding["osv"], level))
+        unwaived = sorted(reachable - ignored)
+        if unwaived:
+            bad[target] = unwaived
+        for osv_id, level in sorted(reported):
+            print(f"reported {osv_id} {target} {level}")
+        summary["targets"][target] = {
+            "reachable": sorted(reachable),
+            "waived": sorted(reachable & ignored),
+            "unwaived": unwaived,
+            "reported": [{"id": osv_id, "level": level} for osv_id, level in sorted(reported)],
+        }
+    summary_path = out / "runner-govulncheck.json"
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    if bad:
+        detail = "; ".join(f"{target}: {', '.join(ids)}" for target, ids in sorted(bad.items()))
+        fail(f"govulncheck: unresolved reachable vulnerability findings ({detail}); see {out}")
+    total_reachable = sum(len(v["reachable"]) for v in summary["targets"].values())
+    total_reported = sum(len(v["reported"]) for v in summary["targets"].values())
+    print(f"govulncheck: no unwaived reachable vulnerability "
+          f"({total_reachable} reachable, all waived or none; "
+          f"{total_reported} reported non-reachable; summary: {summary_path.name})")
+
+
 def final(out, commit):
     required = ["runner-linked-libraries.json", "runner-licenses.json", "runner-native-licenses.json", "runner-sbom.cdx.json", "runner-osv.json", "runner-grype.json"]
     for name in required:
@@ -428,7 +524,7 @@ def final(out, commit):
     if linked.get("schema") != "bashy-runner-linked-libraries-v1" or {x.get("target") for x in linked.get("targets", [])} != set(TARGETS):
         fail("native linked-library inventory does not cover exactly all five targets")
     for target in TARGETS:
-        report = out / f"runner-{target}.govulncheck.txt"
+        report = out / f"runner-{target}.govulncheck.json"
         if not report.is_file() or report.stat().st_size == 0:
             fail(f"govulncheck binary reachability report missing for {target}")
     sbom = load_json(out / "runner-sbom.cdx.json")
@@ -462,9 +558,9 @@ def final(out, commit):
         "\n".join(p.read_text(errors="replace") for p in sorted(notice_files)) +
         ("\n\nNative compiler-input notices:\n" + native_notices if native_notices else ""))
     vulnerability_record = {"schema": "bashy-runner-vulnerability-review-v1", "upstream_commit": commit,
-        "policy": "zero OSV SBOM findings, zero Grype SBOM findings, and zero govulncheck reachable findings in each shipped binary",
+        "policy": "zero non-waived OSV SBOM findings, zero Grype SBOM findings, and zero non-waived reachable govulncheck findings in each shipped binary (waivers: vuln-ignore; module- and package-level findings reported only)",
         "osv_report": "runner-osv.json", "grype_report": "runner-grype.json",
-        "govulncheck_reports": [f"runner-{target}.govulncheck.txt" for target in TARGETS],
+        "govulncheck_reports": [f"runner-{target}.govulncheck.json" for target in TARGETS],
         "unresolved_findings": 0}
     (out / "runner-vulnerabilities.json").write_text(json.dumps(vulnerability_record, indent=2, sort_keys=True) + "\n")
     if not commit or not re.fullmatch(r"[0-9a-f]{40}", commit):
@@ -482,13 +578,14 @@ def main():
     q = sub.add_parser("licenses"); q.add_argument("--report", required=True); q.add_argument("--notices", required=True); q.add_argument("--output", required=True)
     q = sub.add_parser("osv"); q.add_argument("--report", required=True); q.add_argument("--ignore", default=None)
     q = sub.add_parser("grype"); q.add_argument("--report", required=True)
+    q = sub.add_parser("govulncheck"); q.add_argument("--out", type=Path, required=True); q.add_argument("--ignore", default=None); q.add_argument("--targets", default=",".join(TARGETS))
     q = sub.add_parser("aggregate-sbom"); q.add_argument("--out", type=Path, required=True)
     q = sub.add_parser("final"); q.add_argument("--out", type=Path, required=True); q.add_argument("--commit", required=True)
     a = p.parse_args()
     {"inventory": lambda: inventory(a.out, a.report), "merge-inputs": lambda: merge_inputs(a.out),
      "compiler-inputs": lambda: compiler_inputs(a.capture, a.source, a.generated, a.output),
      "native-licenses": lambda: review_native_licenses(a.out, a.review, a.output), "licenses": lambda: licenses(a.report, a.notices, a.output),
-     "osv": lambda: osv(a.report, a.ignore), "grype": lambda: grype(a.report), "aggregate-sbom": lambda: aggregate_sbom(a.out), "final": lambda: final(a.out, a.commit)}[a.mode]()
+     "osv": lambda: osv(a.report, a.ignore), "grype": lambda: grype(a.report), "govulncheck": lambda: govulncheck(a.out, a.ignore, a.targets), "aggregate-sbom": lambda: aggregate_sbom(a.out), "final": lambda: final(a.out, a.commit)}[a.mode]()
 
 
 if __name__ == "__main__":
