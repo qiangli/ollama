@@ -228,6 +228,8 @@ def exercise(binary, fixture, evidence_path, port):
     target = {'Linux': 'linux', 'Darwin': 'darwin', 'Windows': 'windows'}[platform.system()]
     arch = {'x86_64': 'amd64', 'AMD64': 'amd64', 'arm64': 'arm64', 'aarch64': 'arm64'}[platform.machine()]
     asset = f'runner-{target}-{arch}'
+    if binary.name == asset + '-cuda':
+        asset += '-cuda'  # CPU-fallback protocol only; no GPU on hosted runners, so no CUDA inference claim
     require(binary.name == asset + ('.exe' if target == 'windows' else ''), 'native target mismatch')
     metadata = json.loads(binary.with_name(asset + '.json').read_text())
     require(metadata['target'] == f'{target}/{arch}' and metadata['upstream_commit'] == SOURCE,
@@ -238,6 +240,16 @@ def exercise(binary, fixture, evidence_path, port):
                 'platform': platform.platform(), 'checks': {},
                 'network': {'linux': 'netns+strace', 'darwin': 'sandbox-exec+denial-controls',
                             'windows': 'defender-firewall+denial-controls'}[target]}
+    if asset.endswith('-cuda'):
+        # Host-provided driver/cudart/cuBLAS: a host without them must fail
+        # closed; CPU is only ever the explicit fallback. Recorded, never a GPU claim.
+        tool = HERE / 'cuda-link-audit.py'
+        strict = subprocess.run([sys.executable, str(tool), 'host'], capture_output=True, text=True)
+        cpu = subprocess.run([sys.executable, str(tool), 'host', '--cpu-explicit'], capture_output=True, text=True)
+        require(cpu.returncode == 0, 'cuda host-runtime explicit CPU path failed')
+        evidence['host_runtime'] = {'strict_exit': strict.returncode, 'strict_output': (strict.stdout + strict.stderr).strip(),
+                                    'cpu_explicit_output': cpu.stdout.strip(),
+                                    'verdict': 'cuda-present' if strict.returncode == 0 else 'fail-closed; cpu-explicit only'}
     logpath = evidence_path.with_suffix('.log')
     proc = None
     try:

@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 
 TARGETS = ("linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64", "windows-amd64")
+CUDA_TARGET = "linux-amd64-cuda"
+ALL_TARGETS = TARGETS + (CUDA_TARGET,)
 # MIT-0 elected for miniaudio's dual Unlicense OR MIT-0 (S436/#2028): the
 # policy admits MIT, BSD, Apache-2.0, ISC and similar, and MIT-0 is the
 # no-attribution MIT variant.
@@ -145,7 +147,7 @@ def linked_libraries(out, stem, family):
 
 def inventory(out, report):
     rows = []
-    for target in TARGETS:
+    for target in ALL_TARGETS:
         stem = f"runner-{target}"
         inputs = load_json(out / f"{stem}.inputs.json")
         if inputs.get("schema") != "bashy-runner-source-inputs-v1" or not inputs.get("files"):
@@ -185,7 +187,7 @@ def merge_inputs(out):
     # file manifest must resolve, byte-for-byte, to the capture content
     # blobs downloaded from that target's build leg. A missing or tampered
     # blob fails the audit before any license review reads the manifest.
-    for target in TARGETS:
+    for target in ALL_TARGETS:
         stem = f"runner-{target}"
         native = load_json(out / f"{stem}.compiler-inputs.json")
         if native.get("schema") != "bashy-runner-compiler-inputs-v1" or not native.get("files"):
@@ -203,6 +205,13 @@ def merge_inputs(out):
                 fail(f"{stem}: compiler-input blob missing from downloaded build records: {path}")
             if hashlib.sha256(data).hexdigest() != digest:
                 fail(f"{stem}: compiler-input blob hash mismatch: {path}")
+        # Build-only toolkit headers seen by nvcc: bound to the pinned SDK, blobs must resolve.
+        for path, digest in (native.get("cuda_toolkit_inputs") or {}).items():
+            blob = store / digest
+            if not re.fullmatch(r"[0-9a-f]{64}", digest) or not blob.is_file() or hashlib.sha256(blob.read_bytes()).hexdigest() != digest:
+                fail(f"{stem}: CUDA toolkit input blob missing or corrupt: {path}")
+        if target == CUDA_TARGET and not any(p.endswith((".cu", ".cuh")) for p in native["files"]):
+            fail(f"{stem}: no .cu/.cuh compile inputs were captured from nvcc")
 
 
 def compiler_inputs(capture, source, generated, output):
@@ -223,7 +232,7 @@ def compiler_inputs(capture, source, generated, output):
     spec = importlib.util.spec_from_file_location("evidence", Path(__file__).with_name("compiler-evidence.py"))
     evidence = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(evidence)
-    paths, system_headers, trusted = {}, set(), []
+    paths, system_headers, trusted, toolkit = {}, set(), [], {}
     for row in captured:
         if row.get("error") or not row.get("cwd") or not row.get("inputs"):
             fail("missing compile-time input evidence or failed capture")
@@ -245,6 +254,7 @@ def compiler_inputs(capture, source, generated, output):
                 if rel in paths and paths[rel] != digest: fail("compiler input changed between invocations")
                 paths[rel] = digest
             elif category == "system": system_headers.add(item["path"])
+            elif category == "cuda-toolkit": toolkit[rel] = digest
             elif category in ("go-generated", "go-toolchain"): trusted.append(item)
             else: fail("unreviewed external native compiler dependency")
     # Metal source is generated after go generate and may not appear in a C depfile.
@@ -264,6 +274,7 @@ def compiler_inputs(capture, source, generated, output):
     data = {"schema": "bashy-runner-compiler-inputs-v1", "files": files,
             "invocations": len(invocations), "dependency_files": len(depfiles),
             "system_headers": sorted(system_headers), "trusted_go_inputs": trusted,
+            "cuda_toolkit_inputs": dict(sorted(toolkit.items())),
             "compiler_invocations": invocations}
     Path(output).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
@@ -279,7 +290,7 @@ def review_native_licenses(out, review_path, output):
         fail("native license review has wrong schema")
     reviewed = review.get("inputs", {})
     result = []
-    for target in TARGETS:
+    for target in ALL_TARGETS:
         name = f"runner-{target}.compiler-inputs.json"
         native = load_json(Path(out) / name)
         for path, digest in native["files"].items():
@@ -324,7 +335,7 @@ def aggregate_sbom(out):
     lic = load_json(out / "runner-licenses.json")
     licenses_by_package = {x["package"]: x["license"] for x in lic.get("packages", [])}
     modules = {}
-    for target in TARGETS:
+    for target in ALL_TARGETS:
         for package in go_packages(out / f"runner-{target}.deps.json"):
             module = package.get("Module") or {}
             module_path, version = module.get("Path"), module.get("Version")
@@ -353,6 +364,20 @@ def aggregate_sbom(out):
             key = ("platform:" + lib, target["target"])
             bom.setdefault("components", []).append({"type": "library", "group": "platform-provided", "name": lib,
                 "properties": [{"name": "bashy:target", "value": target["target"]}, {"name": "bashy:origin", "value": "operating-system SDK/runtime; not bundled"}]})
+    cuda_manifest = out / f"runner-{CUDA_TARGET}.json"
+    if cuda_manifest.is_file():
+        identity = load_json(cuda_manifest).get("backend_identity") or {}
+        version = identity.get("toolkit_version")
+        components = identity.get("toolkit_components") or []
+        if not version or not components:
+            fail("CUDA manifest lacks exact toolkit version and verified archive digests for the SBOM")
+        for comp in components:
+            if not re.fullmatch(r"[0-9a-f]{64}", comp.get("sha256", "")):
+                fail("CUDA toolkit component lacks a verified archive sha256")
+            bom.setdefault("components", []).append({"type": "file", "group": "build-only-sdk", "name": comp["archive"], "version": version,
+                "hashes": [{"alg": "SHA-256", "content": comp["sha256"]}],
+                "properties": [{"name": "bashy:compiled-target", "value": CUDA_TARGET},
+                               {"name": "bashy:origin", "value": "NVIDIA CUDA toolkit; build-only SDK, not shipped; driver/cudart/cuBLAS host-provided"}]})
     native_review = load_json(out / "runner-native-licenses.json")
     for item in native_review.get("inputs", []):
         bom.setdefault("components", []).append({"type": "file", "name": item["path"],
@@ -360,7 +385,7 @@ def aggregate_sbom(out):
             "licenses": [{"license": {"id": item["license"]}}],
             "properties": [{"name": "bashy:compiled-target", "value": item["target"]},
                            {"name": "bashy:notice", "value": item["notice"]}]})
-    bom.setdefault("properties", []).append({"name": "bashy:compiled-targets", "value": ",".join(TARGETS)})
+    bom.setdefault("properties", []).append({"name": "bashy:compiled-targets", "value": ",".join(ALL_TARGETS)})
     bom["components"].sort(key=lambda x: (x.get("purl", ""), x.get("name", ""), str(x.get("properties", []))))
     path.write_text(json.dumps(bom, indent=2, sort_keys=True) + "\n")
 
@@ -509,7 +534,7 @@ def finding_level(finding):
     return "module"
 
 
-def govulncheck(out, ignore=None, targets=TARGETS):
+def govulncheck(out, ignore=None, targets=ALL_TARGETS):
     # Binary-reachability gate over the per-target govulncheck -json reports
     # under the standing verdict rule: only REACHABLE findings fail, and
     # only when their exact OSV id is not waived in vuln-ignore.
@@ -520,9 +545,9 @@ def govulncheck(out, ignore=None, targets=TARGETS):
     out = Path(out)
     ignored = vuln_ignored_ids(ignore)
     wanted = [t.strip() for t in targets] if not isinstance(targets, str) else [t.strip() for t in targets.split(",")]
-    unknown = [t for t in wanted if t not in TARGETS]
+    unknown = [t for t in wanted if t not in ALL_TARGETS]
     if not wanted or unknown:
-        fail(f"govulncheck targets must be a subset of {','.join(TARGETS)}")
+        fail(f"govulncheck targets must be a subset of {','.join(ALL_TARGETS)}")
     summary = {"schema": "bashy-runner-govulncheck-review-v1",
                "policy": "reachable findings fail unless waived in vuln-ignore; module- and package-level findings are reported only",
                "targets": {}}
@@ -565,15 +590,24 @@ def govulncheck(out, ignore=None, targets=TARGETS):
           f"{total_reported} reported non-reachable; summary: {summary_path.name})")
 
 
+def cuda_hold(out):
+    # A CUDA backend ships NVIDIA toolkit/runtime bytes outside the permissive-only
+    # policy; no review record exists, so any CUDA manifest keeps the audit failed.
+    for manifest in sorted(Path(out).glob("runner-*-cuda.json")):
+        if load_json(manifest).get("release_admission") != "ADMITTED":
+            fail(f"{manifest.name}: CUDA backend not admitted (NVIDIA toolkit/runtime license, linkage, vulnerability and SBOM review absent)")
+
+
 def final(out, commit):
+    cuda_hold(out)
     required = ["runner-linked-libraries.json", "runner-licenses.json", "runner-native-licenses.json", "runner-sbom.cdx.json", "runner-osv.json", "runner-grype.json"]
     for name in required:
         if not (out / name).is_file() or (out / name).stat().st_size == 0:
             fail(f"required audit evidence missing: {name}")
     linked = load_json(out / "runner-linked-libraries.json")
-    if linked.get("schema") != "bashy-runner-linked-libraries-v1" or {x.get("target") for x in linked.get("targets", [])} != set(TARGETS):
-        fail("native linked-library inventory does not cover exactly all five targets")
-    for target in TARGETS:
+    if linked.get("schema") != "bashy-runner-linked-libraries-v1" or {x.get("target") for x in linked.get("targets", [])} != set(ALL_TARGETS):
+        fail("native linked-library inventory does not cover exactly all six targets")
+    for target in ALL_TARGETS:
         report = out / f"runner-{target}.govulncheck.json"
         if not report.is_file() or report.stat().st_size == 0:
             fail(f"govulncheck binary reachability report missing for {target}")
@@ -588,7 +622,7 @@ def final(out, commit):
     if native_review.get("schema") != "bashy-runner-native-license-review-v1":
         fail("native compiler license review has wrong schema")
     expected_native = {}
-    for target in TARGETS:
+    for target in ALL_TARGETS:
         native = load_json(out / f"runner-{target}.compiler-inputs.json")
         for path, digest in native.get("files", {}).items():
             expected_native[(target, path, digest)] = None
@@ -610,12 +644,12 @@ def final(out, commit):
     vulnerability_record = {"schema": "bashy-runner-vulnerability-review-v1", "upstream_commit": commit,
         "policy": "zero non-waived OSV SBOM findings, zero non-waived Grype SBOM findings, and zero non-waived reachable govulncheck findings in each shipped binary (waivers: vuln-ignore; module- and package-level findings reported only)",
         "osv_report": "runner-osv.json", "grype_report": "runner-grype.json",
-        "govulncheck_reports": [f"runner-{target}.govulncheck.json" for target in TARGETS],
+        "govulncheck_reports": [f"runner-{target}.govulncheck.json" for target in ALL_TARGETS],
         "unresolved_findings": 0}
     (out / "runner-vulnerabilities.json").write_text(json.dumps(vulnerability_record, indent=2, sort_keys=True) + "\n")
     if not commit or not re.fullmatch(r"[0-9a-f]{40}", commit):
         fail("expected official upstream commit was not supplied")
-    print(f"compiled-input audit complete for {commit}: five binaries, five Go dependency records, exact native-input license review, native linkage, vulnerabilities, SBOM, and notices")
+    print(f"compiled-input audit complete for {commit}: six binaries, six Go dependency records, exact native-input license review, native linkage, vulnerabilities, SBOM, and notices")
 
 
 def main():
@@ -628,7 +662,7 @@ def main():
     q = sub.add_parser("licenses"); q.add_argument("--report", required=True); q.add_argument("--notices", required=True); q.add_argument("--output", required=True)
     q = sub.add_parser("osv"); q.add_argument("--report", required=True); q.add_argument("--ignore", default=None)
     q = sub.add_parser("grype"); q.add_argument("--report", required=True); q.add_argument("--ignore", default=None)
-    q = sub.add_parser("govulncheck"); q.add_argument("--out", type=Path, required=True); q.add_argument("--ignore", default=None); q.add_argument("--targets", default=",".join(TARGETS))
+    q = sub.add_parser("govulncheck"); q.add_argument("--out", type=Path, required=True); q.add_argument("--ignore", default=None); q.add_argument("--targets", default=",".join(ALL_TARGETS))
     q = sub.add_parser("aggregate-sbom"); q.add_argument("--out", type=Path, required=True)
     q = sub.add_parser("final"); q.add_argument("--out", type=Path, required=True); q.add_argument("--commit", required=True)
     a = p.parse_args()
