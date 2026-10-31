@@ -26,6 +26,12 @@ def audit_link(text):
     for n in needed:
         if n.startswith("libcuda.so"):
             errors.append("libcuda is linked directly; the driver must be dlopen'd from the host")
+    for kind, value in re.findall(r"\((RUNPATH|RPATH)\)\s+Library (?:runpath|rpath): \[([^\]]*)\]", text):
+        # CMake may emit an empty trailing entry or repeat $ORIGIN; every
+        # non-empty entry must be exactly $ORIGIN (never a build/absolute path).
+        entries = [e for e in value.split(":") if e]
+        if not entries or any(e != "$ORIGIN" for e in entries):
+            errors.append(f"{kind} must be absent or exactly $ORIGIN (got [{value}]); no build or absolute paths")
     for line in text.splitlines():
         m = re.match(r"\s*\d+:\s+[0-9a-f]+\s+\d+\s+\S+\s+\S+\s+\S+\s+(\S+)\s+((?:cuda|cublas)\w*)", line)
         if m and m.group(1) != "UND":
